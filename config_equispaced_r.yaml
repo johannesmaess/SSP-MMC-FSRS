@@ -1,0 +1,10 @@
+again_cost: 25
+hard_cost: 14
+good_cost: 10
+easy_cost: 6
+first_rating_prob: [0.15, 0.2, 0.6, 0.05]
+review_rating_prob: [0.3, 0.6, 0.1]
+DECAY: -0.5
+s: [0.1, 365, 0.4]
+d: [1, 10, 0.3]
+r: [0.69, 0.96, 0.03]

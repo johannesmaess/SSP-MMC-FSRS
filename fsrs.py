@@ -1,63 +1,77 @@
 import time
+import yaml
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.ndimage.filters import gaussian_filter
 
 plt.style.use('ggplot')
 
+class RangeConfig:
+    def __init__(self, min_val, max_val, eps):
+        self.min = min_val
+        self.max = max_val
+        self.eps = eps
+        self.size = self._calculate_size()
+
+    def _calculate_size(self):
+        return np.ceil((self.max - self.min) / self.eps + 1).astype(int)
+
 class FsrsSimulator:
-    again_cost = 25
-    hard_cost = 14
-    good_cost = 10
-    easy_cost = 6
-    first_rating_prob = np.array([0.15, 0.2, 0.6, 0.05])
-    review_rating_prob = np.array([0.3, 0.6, 0.1])
+    def __init__(self, w, config_path=None, **kwargs):
+        # Read and apply constants from YAML file
+        if config_path:
+            with open(config_path, 'r') as file:
+                config = yaml.safe_load(file)
+            self.__dict__.update(config)
+            
+        # Override any instance variables with kwargs
+        self.__dict__.update(kwargs)
+        
+        # Convert s, d, r, ivl to RangeConfig objects
+        for key in ['s', 'd', 'r', 'ivl']:
+            if hasattr(self, key): setattr(self, key, RangeConfig(*getattr(self, key)))
+                
+        # Check for required parameters
+        required = ['again_cost', 'hard_cost', 'good_cost', 'easy_cost', 'first_rating_prob', 'review_rating_prob', 'DECAY']
+        for key in required:
+            if not hasattr(self, key):
+                raise ValueError(f"Missing required parameter: {key}")
 
-    s_min = 0.1
-    s_max = 365
-    s_eps = 0.4
-    s_size = np.ceil((s_max - s_min) / s_eps + 1).astype(int)
+        # calculate FACTOR from DECAY
+        self.FACTOR = 0.9 ** (1.0 / self.DECAY) - 1.0
+        
+        # Check if either r or ivl is provided
+        assert hasattr(self, 'r') != hasattr(self, 'ivl'), "Either 'r' or 'ivl' must be provided in config & kwargs."
+        
+        ## Init variable ranges & meshs ##
+        
+        self.s_state = np.linspace(self.s.min, self.s.max, self.s.size)
+        self.d_state = np.linspace(self.d.min, self.d.max, self.d.size)
 
-    d_min = 1
-    d_max = 10
-    d_eps = 0.3
-    d_size = np.ceil((d_max - d_min) / d_eps + 1).astype(int)
-
-    r_min = 0.69
-    r_max = 0.96
-    r_eps = 0.03
-    r_size = np.ceil((r_max - r_min) / r_eps + 1).astype(int)
-
-    DECAY = -0.5
-    FACTOR = 0.9 ** (1.0 / DECAY) - 1.0
-
-    def __init__(self, w, ivl_spacing='equispaced time'):
-        ## Init ##
+        if hasattr(self, 'r'):
+            # option 1: set ivl such that we equispaced sample retrievability (preserving the original implementation)
+            self.r_state = np.linspace(self.r.min, self.r.max, self.r.size)[::-1]
+            self.s_state_mesh, self.d_state_mesh, self.r_state_mesh_org = np.meshgrid(self.s_state, self.d_state, self.r_state)
+            self.ivl_mesh = self.next_interval(self.s_state_mesh, self.r_state_mesh_org)
+        elif hasattr(self, 'ivl'):
+            # option 2: set ivl such that we equispaced sample time
+            self.ivl_state = np.linspace(1, 365, 365)#*2-1)
+            self.s_state_mesh, self.d_state_mesh, self.ivl_mesh = np.meshgrid(self.s_state, self.d_state, self.ivl_state)
+        
+        self.r_state_mesh = self.power_forgetting_curve(self.ivl_mesh, self.s_state_mesh)
+        
+        ## Init weights ##
         
         self.w = w
         
-        self.cost_matrix = np.zeros((self.d_size, self.s_size))
+        ## Init cost matrix ##
+        
+        self.cost_matrix = self.init_cost_matrix()
+        
+    def init_cost_matrix(self):
+        self.cost_matrix = np.zeros((self.d.size, self.s.size))
         self.cost_matrix.fill(1000)
         self.cost_matrix[:, -1] = 0
-
-        self.s_state = np.linspace(self.s_min, self.s_max, self.s_size)
-        self.d_state = np.linspace(self.d_min, self.d_max, self.d_size)
-
-        if ivl_spacing == 'equispaced retrievability':
-            # option 1: set ivl such that we equally sample retrievability (preserving the original implementation)
-            self.r_state = np.linspace(self.r_min, self.r_max, self.r_size)[::-1]
-            self.s_state_mesh, self.d_state_mesh, self.r_state_mesh_org = np.meshgrid(self.s_state, self.d_state, self.r_state)
-            self.ivl_mesh = self.next_interval(self.s_state_mesh, self.r_state_mesh_org)
-        elif ivl_spacing == 'equispaced time':
-            # option 2: set ivl such that we equally sample time
-            self.ivl_state = np.linspace(1, 365, 365)#*2-1)
-            self.s_state_mesh, self.d_state_mesh, self.ivl_mesh = np.meshgrid(self.s_state, self.d_state, self.ivl_state)
-        else:
-            raise ValueError(f"Invalid ivl_spacing: {ivl_spacing}")
-
-        self.r_state_mesh = self.power_forgetting_curve(self.ivl_mesh, self.s_state_mesh)
-        print(self.s_state_mesh.shape, self.d_state_mesh.shape, self.r_state_mesh.shape, self.ivl_mesh.shape)
-        
         
     def power_forgetting_curve(self, t, s): # takes in the time since last review and the stability, returns the retrievability
         return (1 + self.FACTOR * t / s) ** self.DECAY
@@ -95,17 +109,17 @@ class FsrsSimulator:
         return self.mean_reversion(self.w[4], d - self.w[6] * (g - 3))
 
     # stability to index
-    def s2i(self, s): return np.clip(np.floor((s - self.s_min) /
-                                        (self.s_max - self.s_min) * self.s_size).astype(int), 0, self.s_size - 1)
+    def s2i(self, s): return np.clip(np.floor((s - self.s.min) /
+                                        (self.s.max - self.s.min) * self.s.size).astype(int), 0, self.s.size - 1)
 
     # difficulty to index
-    def d2i(self, d): return np.clip(np.floor((d - self.d_min) /
-                                        (self.d_max - self.d_min) * self.d_size).astype(int), 0, self.d_size - 1)
+    def d2i(self, d): return np.clip(np.floor((d - self.d.min) /
+                                        (self.d.max - self.d.min) * self.d.size).astype(int), 0, self.d.size - 1)
 
 
     # # retention to index
-    # def r2i(r): return np.clip(np.floor((r - r_min) /
-    #                                     (r_max - r_min) * r_size).astype(int), 0, r_size - 1)
+    # def r2i(r): return np.clip(np.floor((r - r.min) /
+    #                                     (r.max - r.min) * r.size).astype(int), 0, r.size - 1)
 
     # indexes to cost
     def i2c(self, s, d):
@@ -126,7 +140,7 @@ class FsrsSimulator:
         return self.get_init_cost() @ self.first_rating_prob
     
     def get_retention_matrix(self):
-        ii, jj = np.ogrid[:self.d_size, :self.s_size]
+        ii, jj = np.ogrid[:self.d.size, :self.s.size]
         retention_matrix = self.r_state_mesh[ii,jj,np.argmin(self.cost_matrix_per_ivl, axis=2)]
         return retention_matrix
     
@@ -137,7 +151,7 @@ class FsrsSimulator:
         diff = 1e10
 
         start = time.time()
-        while i < max_iter and diff > minimum_diff_per_iteration * self.s_size * self.d_size:
+        while i < max_iter and diff > minimum_diff_per_iteration * self.s.size * self.d.size:
             next_stability_after_again = self.stability_after_failure(
                 self.s_state_mesh, self.d_state_mesh, self.r_state_mesh
             )
