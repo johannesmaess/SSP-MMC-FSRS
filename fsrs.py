@@ -66,16 +66,18 @@ class FsrsSimulator:
         
         ## Init cost matrix ##
         
-        self.cost_matrix = self.init_cost_matrix()
+        self.init_cost_matrix()
         
     def init_cost_matrix(self):
         self.cost_matrix = np.zeros((self.d.size, self.s.size))
         self.cost_matrix.fill(1000)
         self.cost_matrix[:, -1] = 0
         
+        self.cost_matrix_per_ivl = None
+        self.num_iter = 0
+        
     def power_forgetting_curve(self, t, s): # takes in the time since last review and the stability, returns the retrievability
         return (1 + self.FACTOR * t / s) ** self.DECAY
-
 
     def next_interval(self, s, r): # takes in stability and (desired) retrievability, returns the interval at which this is achieved
         ivl = s / self.FACTOR * (r ** (1.0 / self.DECAY) - 1.0)
@@ -146,12 +148,10 @@ class FsrsSimulator:
     
     def run(self, max_iter=1000, minimum_diff_per_iteration=1e-4):
         ## value iteration ##
-        
-        i = 0
         diff = 1e10
 
         start = time.time()
-        while i < max_iter and diff > minimum_diff_per_iteration * self.s.size * self.d.size:
+        while self.num_iter < max_iter and diff > minimum_diff_per_iteration * self.s.size * self.d.size:
             next_stability_after_again = self.stability_after_failure(
                 self.s_state_mesh, self.d_state_mesh, self.r_state_mesh
             )
@@ -198,12 +198,49 @@ class FsrsSimulator:
             diff = self.cost_matrix.sum() - optimal_cost.sum()
             self.cost_matrix = optimal_cost
 
-            if i % 10 == 0:
-                print(f"iteration {i:>5}, diff {diff:.2f}, time {time.time() - start:.2f}s")
-            i += 1
+            if self.num_iter % 10 == 0:
+                print(f"iteration {self.num_iter:>5}, diff {diff:.2f}, time {time.time() - start:.2f}s")
+            self.num_iter += 1
 
         end = time.time()
         print(f"Time: {end - start:.2f}s")
         
     def optimal_cost_matrix(self):
         return np.minimum(self.cost_matrix, self.cost_matrix_per_ivl.min(axis=2))
+    
+    
+class FsrsSimulatorStorable(FsrsSimulator):
+    def __init__(self, w, config_path, npy_path=None):
+        self.representative_config_path = config_path
+        super().__init__(w=w, config_path=config_path)
+        if npy_path: self.load(npy_path)
+    
+    def get_filename(self):
+        w_str = '_'.join([f'{round(w, 2):1.2f}' for w in self.w])
+        config_str = self.representative_config_path.split('/')[-1].replace('.yaml', '')
+        
+        fn = f"{config_str}__{w_str}__{self.num_iter}"
+        return fn
+    
+    def get_path_npy(self):
+        return f"{self.get_filename()}.npy"
+        
+    def save(self):
+        np.save(self.get_path_npy(), self.cost_matrix_per_ivl)
+    
+    def load(self, path):
+        # check that path matches the config (except for the num_iter part of the filename)
+        assert path.endswith('.npy'), "Path must be a .npy file."
+        fn = path.split('/')[-1].replace('.npy', '')
+        num_iter = int(fn.split('__')[-1])
+        fn_config = fn.replace(f"__{num_iter}", '')
+        assert self.get_filename().startswith(fn_config), "Path does not match the config."
+        
+        # set the cost matrices and num_iter from path
+        self.cost_matrix_per_ivl = np.load(path)
+        self.cost_matrix = self.optimal_cost_matrix()
+        self.num_iter = num_iter
+        
+    def run(self, *args, save=True, **kwargs):
+        super().run(*args, **kwargs)
+        if save: self.save()
